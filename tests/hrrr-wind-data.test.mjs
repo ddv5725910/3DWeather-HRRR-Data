@@ -10,6 +10,7 @@ import {
   downsampleWindGrid2x,
   extractWindTile,
   packWindBinary,
+  parseWindOrientation,
   selectWindRecords,
   validateWindInventory,
   windManifestSource,
@@ -51,6 +52,12 @@ test('validates the two-time wgrib2 wind inventory', () => {
     () => validateWindInventory(text.replace(':VGRD:10 m above ground:', ':TMP:10 m above ground:')),
     /Unexpected HRRR wind field/
   );
+});
+
+test('detects whether GRIB wind components follow the Lambert grid or true north', () => {
+  assert.equal(parseWindOrientation('grid_template=30:winds(grid):'), 'grid-relative');
+  assert.equal(parseWindOrientation('grid_template=30:winds(N/S):'), 'earth-relative');
+  assert.throws(() => parseWindOrientation('Lambert Conformal'), /no winds/);
 });
 
 test('packs field-major floats as point-major signed U/V components at 0.1 m/s', () => {
@@ -130,11 +137,13 @@ test('manifest and tile scripts expose a self-describing native 3 km dataset', (
     validTimes:['2026-07-19T05:00:00Z', '2026-07-19T06:00:00Z'],
     datasetId:'fixture-wind',
     projection,
+    windOrientation:'grid-relative',
     tileSize:256,
     lods
   }), context);
   assert.equal(context.HRRR_WIND_MANIFEST.levels[0].id, '10m');
   assert.equal(context.HRRR_WIND_MANIFEST.nativeResolutionM, 3000);
+  assert.equal(context.HRRR_WIND_MANIFEST.windOrientation, 'grid-relative');
   assert.equal(context.HRRR_WIND_MANIFEST.aggregation, '2x2-vector-component-mean');
 
   const packed = Buffer.alloc(LEVELS.length * 8);

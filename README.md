@@ -17,8 +17,10 @@ than committed to Git history.
 The wind workflow reads `UGRD` and `VGRD` at 10 m AGL plus the same twelve
 pressure levels. It stores two hourly valid times as signed vector components
 at 0.1 m/s, preserving the native 3 km grid. Coarser LODs average U/V
-components, never direction angles. One manifest and 59 tiles are replaced
-hourly under the stable
+components, never direction angles. The manifest records HRRR's
+`winds(grid)` convention so the browser can rotate grid-relative U/V into
+geographic east/north with the Lambert convergence angle. One manifest and 59
+tiles are replaced hourly under the stable
 [`hrrr-wind-data`](../../releases/tag/hrrr-wind-data) Release.
 
 Data source: [NOAA HRRR Open Data](https://registry.opendata.aws/noaa-hrrr-pds/).

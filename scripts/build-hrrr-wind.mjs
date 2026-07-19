@@ -139,6 +139,15 @@ export function validateWindInventory(text) {
   return true;
 }
 
+export function parseWindOrientation(text) {
+  const match = String(text || '').match(/winds\(\s*([^)]+?)\s*\)/i);
+  if (!match) throw new Error('HRRR wind grid metadata has no winds(...) orientation');
+  const value = match[1].trim().toLowerCase();
+  if (value === 'grid') return 'grid-relative';
+  if (value === 'n/s' || value === 'earth') return 'earth-relative';
+  throw new Error(`Unsupported HRRR wind orientation: winds(${match[1]})`);
+}
+
 function finiteWind(value) {
   return Number.isFinite(value) && Math.abs(value) < 1000;
 }
@@ -275,7 +284,8 @@ export function windManifestSource(meta) {
     run:meta.run,
     validTimes:meta.validTimes,
     levels:LEVELS.map(({ inventory, ...level }) => level),
-    variables:{ eastward:'UGRD', northward:'VGRD' },
+    variables:{ gridX:'UGRD', gridY:'VGRD' },
+    windOrientation:meta.windOrientation,
     datasetId:meta.datasetId,
     projection:meta.projection,
     tileSize:meta.tileSize,
@@ -316,9 +326,11 @@ async function build(options = {}) {
     writeFileSync(miniGrib, Buffer.concat(pieces));
 
     const executable = options.wgrib2 || process.env.WGRIB2 || 'wgrib2';
-    const projection = parseNativeGrid(
-      runWgrib2(executable, [miniGrib, '-d', '1', '-grid'], 'wgrib2 wind grid inspection')
+    const gridText = runWgrib2(
+      executable, [miniGrib, '-d', '1', '-grid'], 'wgrib2 wind grid inspection'
     );
+    const projection = parseNativeGrid(gridText);
+    const windOrientation = parseWindOrientation(gridText);
     validateWindInventory(runWgrib2(executable, [miniGrib, '-s'], 'wgrib2 wind inventory validation'));
     runWgrib2(executable, [
       miniGrib, '-order', 'we:sn', '-no_header', '-bin', rawBin
@@ -370,6 +382,7 @@ async function build(options = {}) {
       validTimes,
       datasetId,
       projection,
+      windOrientation,
       tileSize:TILE_SIZE,
       lods,
       releaseBaseUrl:options.releaseBaseUrl
