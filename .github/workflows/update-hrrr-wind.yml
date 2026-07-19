@@ -1,0 +1,58 @@
+name: Update HRRR wind tiles
+
+on:
+  schedule:
+    # Run after the cloud job's minute-17 start so both jobs avoid NOAA's
+    # top-of-hour publication burst.
+    - cron: '27 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-hrrr-wind
+  cancel-in-progress: true
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: conda-incubator/setup-miniconda@v3
+        with:
+          activate-environment: hrrr
+          auto-activate-base: false
+          channels: conda-forge
+          python-version: '3.12'
+      - name: Install NOAA wgrib2 processor
+        shell: bash -el {0}
+        run: conda install --yes --quiet wgrib2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Validate HRRR wind range and tile code
+        run: node --test tests/hrrr-wind-data.test.mjs
+      - name: Build native HRRR wind tile pyramid
+        shell: bash -el {0}
+        run: node scripts/build-hrrr-wind.mjs --out dist/hrrr-wind/hrrr-wind-manifest.js
+      - name: Validate generated classic scripts
+        run: |
+          find dist/hrrr-wind -name '*.js' -print0 | xargs -0 -n1 node --check
+          test "$(find dist/hrrr-wind -name 'hrrr-wind-l*.js' | wc -l)" -eq 59
+          test "$(stat -c%s dist/hrrr-wind/hrrr-wind-manifest.js)" -lt 50000
+          test "$(find dist/hrrr-wind -name 'hrrr-wind-l*.js' -size +10000000c | wc -l)" -eq 0
+      - name: Replace stable release wind assets without growing Git history
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view hrrr-wind-data >/dev/null 2>&1; then
+            gh release create hrrr-wind-data \
+              --title "Live HRRR wind data" \
+              --notes "Public, automatically replaced native-grid NOAA HRRR U/V tile pyramid for 3DWeather." \
+              --prerelease
+          fi
+          gh release upload hrrr-wind-data \
+            dist/hrrr-wind/*.js \
+            --clobber
