@@ -1,4 +1,4 @@
-name: Update HRRR cloud snapshot
+name: Update HRRR cloud timeline
 
 on:
   schedule:
@@ -12,12 +12,16 @@ permissions:
 
 concurrency:
   group: update-hrrr-clouds
-  cancel-in-progress: true
+  # A 31-frame build is intentionally heavier than the old two-frame
+  # snapshot. Never kill a nearly-complete publication at the next cron tick.
+  cancel-in-progress: false
 
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 180
+    env:
+      DATASET_TAG: hrrr-cloud-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v4
       - uses: conda-incubator/setup-miniconda@v3
@@ -36,23 +40,51 @@ jobs:
         run: node --test tests/hrrr-cloud-data.test.mjs
       - name: Build native HRRR cloud tile pyramid
         shell: bash -el {0}
-        run: node scripts/build-hrrr-clouds.mjs --out dist/hrrr-clouds/hrrr-cloud-manifest.js
+        run: |
+          node scripts/build-hrrr-clouds.mjs \
+            --history-hours 12 \
+            --forecast-hours 18 \
+            --time-chunk-size 3 \
+            --release-base-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${DATASET_TAG}/" \
+            --out dist/hrrr-clouds/hrrr-cloud-manifest.js
       - name: Validate generated classic scripts
         run: |
           find dist/hrrr-clouds -name '*.js' -print0 | xargs -0 -n1 node --check
-          test "$(find dist/hrrr-clouds -name 'hrrr-cloud-l*.js' | wc -l)" -eq 59
-          test "$(stat -c%s dist/hrrr-clouds/hrrr-cloud-manifest.js)" -lt 50000
-          test "$(find dist/hrrr-clouds -name 'hrrr-cloud-l*.js' -size +8000000c | wc -l)" -eq 0
-      - name: Replace stable release tile assets without growing Git history
+          test "$(find dist/hrrr-clouds -name 'hrrr-cloud-t*-l*.js' | wc -l)" -eq 649
+          test "$(stat -c%s dist/hrrr-clouds/hrrr-cloud-manifest.js)" -lt 200000
+          test "$(find dist/hrrr-clouds -name 'hrrr-cloud-t*-l*.js' -size +12000000c | wc -l)" -eq 0
+      - name: Publish an atomic versioned dataset and advance the stable manifest
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          if ! gh release view "${DATASET_TAG}" >/dev/null 2>&1; then
+            gh release create "${DATASET_TAG}" \
+              --title "HRRR cloud dataset ${DATASET_TAG}" \
+              --notes "Immutable hourly NOAA HRRR cloud timeline used by the stable manifest." \
+              --prerelease
+          fi
+          gh release upload "${DATASET_TAG}" \
+            dist/hrrr-clouds/*.js \
+            --clobber
+
           if ! gh release view hrrr-cloud-data >/dev/null 2>&1; then
             gh release create hrrr-cloud-data \
               --title "Live HRRR cloud data" \
-              --notes "Public, automatically replaced native-grid NOAA HRRR cloud tile pyramid for 3DWeather." \
+              --notes "Stable manifest for the current public NOAA HRRR cloud timeline used by 3DWeather." \
               --prerelease
           fi
+          # This is the commit point. The manifest refers only to a versioned
+          # release whose full tile set has already uploaded successfully.
           gh release upload hrrr-cloud-data \
-            dist/hrrr-clouds/*.js \
+            dist/hrrr-clouds/hrrr-cloud-manifest.js \
             --clobber
+
+          # Keep four completed hourly datasets so clients holding a cached
+          # manifest never lose their immutable tile URLs mid-session.
+          mapfile -t expired_tags < <(
+            gh release list --limit 30 --json tagName,createdAt \
+              --jq '[.[] | select(.tagName | startswith("hrrr-cloud-")) | select(.tagName != "hrrr-cloud-data")] | sort_by(.createdAt) | reverse | .[4:] | .[].tagName'
+          )
+          for tag in "${expired_tags[@]}"; do
+            gh release delete "${tag}" --yes --cleanup-tag
+          done

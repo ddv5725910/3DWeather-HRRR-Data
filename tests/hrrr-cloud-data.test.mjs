@@ -5,10 +5,15 @@ import vm from 'node:vm';
 
 import {
   LEVELS, VARIABLES, LOD_COUNT, TILE_SIZE,
-  cloudManifestSource, cloudTileSource, coalesceCloudRanges, condensateDensity,
+  cloudManifestSource, cloudTileSource,
+  cloudTimelineManifestSource, cloudTimelineTileSource,
+  coalesceCloudRanges, condensateDensity,
   downsamplePackedGrid, downsamplePackedGrid2x, extractPackedTile, fetchByteRanges,
-  gridDefinition, packRegriddedBinary, parseIndex, parseNativeGrid, productUrl,
-  selectCloudRecords, snapshotSource, validateRegriddedInventory
+  downsampleTimelineFrame2x, extractTimelineFrameTile,
+  gridDefinition, packRegriddedBinary, packTimelineFrameBinary,
+  parseIndex, parseNativeGrid, productUrl, resolveLatestRun, timelineFrameSpecs,
+  selectCloudRecords, snapshotSource, validateRegriddedInventory,
+  validateTimelineFrameInventory
 } from '../scripts/build-hrrr-clouds.mjs';
 
 function syntheticIndex() {
@@ -47,6 +52,44 @@ test('HRRR product URL uses the public NOAA Open Data S3 layout', () => {
     productUrl(run, 1, '.idx'),
     'https://noaa-hrrr-bdp-pds.s3.amazonaws.com/hrrr.20260717/conus/hrrr.t05z.wrfprsf01.grib2.idx'
   );
+});
+
+test('timeline is exactly wall-clock −12h through +18h while one complete run supplies forecasts', async () => {
+  const anchor = Date.parse('2026-07-19T08:00:00Z');
+  const forecastRun = Date.parse('2026-07-19T05:00:00Z');
+  const frames = timelineFrameSpecs(anchor, 12, 18, 3, forecastRun);
+  assert.equal(frames.length, 31);
+  assert.equal(frames[0].validTime, '2026-07-18T20:00:00Z');
+  assert.equal(frames[0].sourceRun, '2026-07-18T20:00:00Z');
+  assert.equal(frames[0].forecastHour, 0);
+  assert.equal(frames[12].validTime, '2026-07-19T08:00:00Z');
+  assert.equal(frames[12].sourceRun, '2026-07-19T05:00:00Z');
+  assert.equal(frames[12].forecastHour, 3);
+  assert.equal(frames.at(-1).validTime, '2026-07-20T02:00:00Z');
+  assert.equal(frames.at(-1).forecastHour, 21);
+  assert.equal(new Set(frames.map(frame => frame.timeChunk)).size, 11);
+
+  const probes = [];
+  const resolved = await resolveLatestRun({
+    now:Date.parse('2026-07-19T08:17:00Z'),
+    requiredValidTime:Date.parse('2026-07-20T02:00:00Z'),
+    fetchImpl:async url => {
+      probes.push(url);
+      const available = url.includes('hrrr.t06z.wrfprsf20.grib2.idx');
+      return {
+        ok:available,
+        status:available ? 200 : 404,
+        headers:{ get:() => null },
+        text:async () => available
+          ? ':HGT:1000 mb:anl:\n:CIMIXR:850 mb:anl:'
+          : ''
+      };
+    },
+    timeoutMs:100
+  });
+  assert.equal(resolved, Date.parse('2026-07-19T06:00:00Z'));
+  assert.ok(probes[0].includes('hrrr.t07z.wrfprsf19.grib2.idx'));
+  assert.ok(probes[1].includes('hrrr.t06z.wrfprsf20.grib2.idx'));
 });
 
 test('range downloader rejects a full-file response and validates exact byte boundaries', async () => {
@@ -113,6 +156,55 @@ test('regridded fields pack point-major time pairs with actual monotonic HRRR he
   assert.equal(packed[samples + 2], 63);
   assert.equal(packed.readUInt16LE(samples * 2 + 2 * 2), 1700);
   assert.equal(packed.readUInt16LE(samples * 4 + 2 * 2), 1710);
+});
+
+test('timeline chunks publish three frame-major density/height payloads', () => {
+  const grid = { nx:2, ny:1, dxM:3000, dyM:3000 };
+  const points = grid.nx * grid.ny;
+  const fields = LEVELS.length * VARIABLES.length;
+  const values = new Float32Array(fields * points);
+  const inventory = [];
+  for (let level = 0; level < LEVELS.length; level++) {
+    const field = level * VARIABLES.length;
+    for (let point = 0; point < points; point++) {
+      values[field * points + point] = 120 + level * 850 + point;
+      values[(field + 1) * points + point] = level === 1 ? 7.5e-5 : 0;
+      values[(field + 2) * points + point] = point ? 1e-5 : 0;
+    }
+    for (const variable of VARIABLES) {
+      inventory.push(`${inventory.length + 1}:0:d=2026071903:${variable}:${LEVELS[level]} mb:7 hour fcst:`);
+    }
+  }
+  assert.equal(validateTimelineFrameInventory(inventory.join('\n'), 7), true);
+  const packed = packTimelineFrameBinary(Buffer.from(values.buffer), grid);
+  const samples = points * LEVELS.length;
+  assert.equal(packed.length, samples * 3);
+  assert.equal(packed[1], 63);
+  assert.equal(packed.readUInt16LE(samples + 2), 970);
+  assert.equal(downsampleTimelineFrame2x(packed, grid).grid.dxM, 6000);
+
+  const tile = extractTimelineFrameTile(packed, grid, 0, 0, 2);
+  const source = cloudTimelineTileSource({
+    datasetId:'timeline-unit-test',
+    timeChunk:'t00',
+    frameIds:['v2026071903','v2026071904','v2026071905'],
+    validTimes:[
+      '2026-07-19T03:00:00Z',
+      '2026-07-19T04:00:00Z',
+      '2026-07-19T05:00:00Z'
+    ],
+    lod:0, tileX:0, tileY:0,
+    x0:tile.x0, y0:tile.y0, nx:tile.nx, ny:tile.ny
+  }, [tile.packed, tile.packed, tile.packed]);
+  const context = { globalThis:{} };
+  vm.runInNewContext(source, context);
+  const published = context.globalThis.HRRR_CLOUD_TILE_QUEUE[0];
+  assert.equal(published.schemaVersion, 3);
+  assert.equal(published.frameIds.length, 3);
+  assert.equal(
+    gunzipSync(Buffer.from(published.payload, 'base64')).length,
+    tile.packed.length * 3
+  );
 });
 
 test('native HRRR Lambert metadata is retained at the operational 1799×1059 3 km grid', () => {

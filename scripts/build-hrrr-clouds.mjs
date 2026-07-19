@@ -30,6 +30,9 @@ const RANGE_CONCURRENCY = 4;
 const RETRYABLE_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
 export const LOD_COUNT = 6;
 export const TILE_SIZE = 256;
+export const HISTORY_HOURS = 12;
+export const FORECAST_HOURS = 18;
+export const TIME_CHUNK_SIZE = 3;
 
 export const LEVELS = Object.freeze([1000, 900, 850, 800, 700, 600, 500, 400, 300, 250, 200, 150]);
 export const STANDARD_HEIGHTS_M = Object.freeze([111, 988, 1457, 1949, 3012, 4206, 5574, 7185, 9164, 10363, 11784, 13608]);
@@ -95,6 +98,49 @@ export function runParts(runMs) {
   ].join('');
   const hour = String(date.getUTCHours()).padStart(2, '0');
   return { day, hour, iso:`${day.slice(0, 4)}-${day.slice(4, 6)}-${day.slice(6, 8)}T${hour}:00:00Z` };
+}
+
+export function timelineFrameSpecs(
+  anchorMs,
+  historyHours = HISTORY_HOURS,
+  forecastHours = FORECAST_HOURS,
+  chunkSize = TIME_CHUNK_SIZE,
+  forecastRunMs = anchorMs
+) {
+  if (!Number.isFinite(+anchorMs)) throw new Error('Timeline anchor must be a UTC time');
+  const anchor = Math.floor(+anchorMs / 3_600_000) * 3_600_000;
+  const forecastRun = Math.floor(+forecastRunMs / 3_600_000) * 3_600_000;
+  if (!Number.isFinite(forecastRun) || forecastRun > anchor) {
+    throw new Error('Timeline forecast run must be at or before the UTC anchor');
+  }
+  const history = Math.max(0, Math.round(+historyHours || 0));
+  const forecast = Math.max(0, Math.round(+forecastHours || 0));
+  const groupSize = Math.max(1, Math.round(+chunkSize || 1));
+  const frames = [];
+  for (let offsetHour = -history; offsetHour <= forecast; offsetHour++) {
+    const validMs = anchor + offsetHour * 3_600_000;
+    // Past frames use their own f00 analysis. "Now" and future frames all use
+    // one complete forecast run, which may be a few hours behind wall-clock
+    // time while still targeting the exact real UTC hour on the timeline.
+    const sourceRunMs = offsetHour < 0 ? validMs : forecastRun;
+    const forecastHour = offsetHour < 0
+      ? 0
+      : Math.round((validMs - forecastRun) / 3_600_000);
+    const valid = runParts(validMs);
+    const index = frames.length;
+    frames.push({
+      id:`v${valid.day}${valid.hour}`,
+      validTime:valid.iso,
+      sourceRun:runParts(sourceRunMs).iso,
+      sourceRunMs,
+      forecastHour,
+      kind:forecastHour === 0 ? 'analysis' : 'forecast',
+      offsetHour,
+      timeChunk:`t${String(Math.floor(index / groupSize)).padStart(2, '0')}`,
+      timeIndex:index % groupSize
+    });
+  }
+  return frames;
 }
 
 export function productUrl(runMs, forecastHour, suffix = '') {
@@ -212,6 +258,9 @@ export async function fetchByteRanges(url, ranges, options = {}) {
 
 export async function resolveLatestRun(options = {}) {
   const now = Number.isFinite(+options.now) ? +options.now : Date.now();
+  const requiredValidTime = Number.isFinite(+options.requiredValidTime)
+    ? Math.floor(+options.requiredValidTime / 3_600_000) * 3_600_000
+    : NaN;
   // Operational files are not instantaneous at the top of the hour. Start
   // from the prior UTC hour, then walk backwards without retrying nonexistent
   // cycles as if they were transient server failures.
@@ -219,8 +268,12 @@ export async function resolveLatestRun(options = {}) {
   const fetchImpl = options.fetchImpl || fetch;
   for (let offset = 0; offset < 8; offset++) {
     const runMs = first - offset * 3_600_000;
+    const forecastHour = Number.isFinite(requiredValidTime)
+      ? Math.round((requiredValidTime - runMs) / 3_600_000)
+      : 1;
+    if (forecastHour < 0 || forecastHour > 48) continue;
     try {
-      const response = await fetchResponse(productUrl(runMs, 1, '.idx'), {
+      const response = await fetchResponse(productUrl(runMs, forecastHour, '.idx'), {
         fetchImpl,
         attempts:1,
         timeoutMs:options.timeoutMs || 12_000
@@ -328,6 +381,32 @@ export function validateRegriddedInventory(text) {
   return true;
 }
 
+export function validateTimelineFrameInventory(text, forecastHour = 0) {
+  const hour = Math.max(0, Math.round(+forecastHour || 0));
+  const lines = String(text || '').trim().split(/\r?\n/).filter(Boolean);
+  const expected = [];
+  for (const level of LEVELS) for (const variable of VARIABLES) {
+    expected.push({ level, variable });
+  }
+  if (lines.length !== expected.length) {
+    throw new Error(`Unexpected HRRR timeline field count: ${lines.length}/${expected.length}`);
+  }
+  for (let index = 0; index < expected.length; index++) {
+    const item = expected[index];
+    const line = lines[index];
+    if (!line.includes(`:${item.variable}:${item.level} mb:`)) {
+      throw new Error(`Unexpected HRRR timeline field ${index + 1}: ${line}`);
+    }
+    const validForecast = hour === 0
+      ? /:(?:anl|0 hour fcst):/.test(line)
+      : new RegExp(`:${hour} hour fcst:`).test(line);
+    if (!validForecast) {
+      throw new Error(`Unexpected HRRR timeline valid time at field ${index + 1}: ${line}`);
+    }
+  }
+  return true;
+}
+
 export function condensateDensity(cloudLiquid, cloudIce) {
   const liquid = validFloat(cloudLiquid) && cloudLiquid > 0 ? cloudLiquid : 0;
   const ice = validFloat(cloudIce) && cloudIce > 0 ? cloudIce : 0;
@@ -386,6 +465,53 @@ export function packRegriddedBinary(raw, grid) {
         packed.writeUInt16LE(Math.min(30_000, height), offset);
         previous = height;
       }
+    }
+  }
+  return packed;
+}
+
+export function packTimelineFrameBinary(raw, grid) {
+  const points = grid.nx * grid.ny;
+  const fields = LEVELS.length * VARIABLES.length;
+  const expectedBytes = fields * points * 4;
+  if (raw.length !== expectedBytes) {
+    throw new Error(`Unexpected timeline wgrib2 binary size: ${raw.length}/${expectedBytes}`);
+  }
+  const values = new Float32Array(raw.buffer, raw.byteOffset, raw.byteLength / 4);
+  const samples = points * LEVELS.length;
+  const packed = Buffer.allocUnsafe(samples * 3);
+  const heightBase = samples;
+  for (let level = 0; level < LEVELS.length; level++) {
+    const field = level * VARIABLES.length;
+    const hOffset = field * points;
+    const liquidOffset = (field + 1) * points;
+    const iceOffset = (field + 2) * points;
+    for (let point = 0; point < points; point++) {
+      const sample = point * LEVELS.length + level;
+      packed[sample] = condensateDensity(
+        values[liquidOffset + point],
+        values[iceOffset + point]
+      );
+      const height = values[hOffset + point];
+      const safeHeight = validFloat(height) && height >= -1000 && height <= 30_000
+        ? height
+        : STANDARD_HEIGHTS_M[level];
+      packed.writeUInt16LE(
+        Math.round(Math.max(0, Math.min(30_000, safeHeight))),
+        heightBase + sample * 2
+      );
+    }
+  }
+  for (let point = 0; point < points; point++) {
+    let previous = 0;
+    for (let level = 0; level < LEVELS.length; level++) {
+      const offset = heightBase + (point * LEVELS.length + level) * 2;
+      const height = Math.max(
+        packed.readUInt16LE(offset),
+        previous + (level ? 50 : 0)
+      );
+      packed.writeUInt16LE(Math.min(30_000, height), offset);
+      previous = height;
     }
   }
   return packed;
@@ -525,6 +651,110 @@ export function extractPackedTile(packed, grid, tileX, tileY, tileSize = TILE_SI
   return { packed:result, x0, y0, nx, ny };
 }
 
+function timelinePackedLayout(packed, grid) {
+  const samples = grid.nx * grid.ny * LEVELS.length;
+  if (packed.length !== samples * 3) {
+    throw new Error(`Packed timeline frame does not match grid: ${packed.length}/${samples * 3}`);
+  }
+  return { samples, cover:0, height:samples };
+}
+
+export function downsampleTimelineFrame2x(packed, grid) {
+  const source = timelinePackedLayout(packed, grid);
+  const nx = Math.ceil(grid.nx / 2);
+  const ny = Math.ceil(grid.ny / 2);
+  const targetGrid = {
+    ...grid,
+    nx,
+    ny,
+    dxM:grid.dxM * 2,
+    dyM:grid.dyM * 2
+  };
+  const targetSamples = nx * ny * LEVELS.length;
+  const result = Buffer.alloc(targetSamples * 3);
+  for (let y = 0; y < ny; y++) for (let x = 0; x < nx; x++) {
+    for (let level = 0; level < LEVELS.length; level++) {
+      const targetSample = (y * nx + x) * LEVELS.length + level;
+      let coverSum = 0, heightSum = 0, count = 0;
+      for (let oy = 0; oy < 2; oy++) for (let ox = 0; ox < 2; ox++) {
+        const sx = x * 2 + ox, sy = y * 2 + oy;
+        if (sx >= grid.nx || sy >= grid.ny) continue;
+        const sourceSample = (sy * grid.nx + sx) * LEVELS.length + level;
+        coverSum += packed[source.cover + sourceSample];
+        heightSum += packed.readUInt16LE(source.height + sourceSample * 2);
+        count++;
+      }
+      result[targetSample] = Math.round(coverSum / Math.max(1, count));
+      result.writeUInt16LE(
+        Math.round(heightSum / Math.max(1, count)),
+        targetSamples + targetSample * 2
+      );
+    }
+  }
+  return { packed:result, grid:targetGrid };
+}
+
+export function extractTimelineFrameTile(
+  packed,
+  grid,
+  tileX,
+  tileY,
+  tileSize = TILE_SIZE
+) {
+  const source = timelinePackedLayout(packed, grid);
+  const x0 = tileX * tileSize, y0 = tileY * tileSize;
+  const nx = Math.max(0, Math.min(tileSize, grid.nx - x0));
+  const ny = Math.max(0, Math.min(tileSize, grid.ny - y0));
+  if (!nx || !ny) throw new Error(`Timeline tile ${tileX},${tileY} is outside ${grid.nx}×${grid.ny}`);
+  const samples = nx * ny * LEVELS.length;
+  const result = Buffer.alloc(samples * 3);
+  const copyBlock = (sourceOffset, targetOffset, bytes) => {
+    for (let y = 0; y < ny; y++) for (let x = 0; x < nx; x++) {
+      const sourceSample = ((y0 + y) * grid.nx + x0 + x) * LEVELS.length;
+      const targetSample = (y * nx + x) * LEVELS.length;
+      packed.copy(
+        result,
+        targetOffset + targetSample * bytes,
+        sourceOffset + sourceSample * bytes,
+        sourceOffset + (sourceSample + LEVELS.length) * bytes
+      );
+    }
+  };
+  copyBlock(source.cover, 0, 1);
+  copyBlock(source.height, samples, 2);
+  return { packed:result, x0, y0, nx, ny };
+}
+
+export function cloudTimelineTileSource(meta, frameTiles) {
+  if (!Array.isArray(frameTiles) || !frameTiles.length) {
+    throw new Error('Timeline tile requires at least one frame');
+  }
+  const packed = Buffer.concat(frameTiles);
+  const payload = gzipSync(packed, { level:9, mtime:0 }).toString('base64');
+  const tile = {
+    schemaVersion:3,
+    datasetId:meta.datasetId,
+    timeChunk:meta.timeChunk,
+    frameIds:meta.frameIds,
+    validTimes:meta.validTimes,
+    lod:meta.lod,
+    tileX:meta.tileX,
+    tileY:meta.tileY,
+    x0:meta.x0,
+    y0:meta.y0,
+    nx:meta.nx,
+    ny:meta.ny,
+    encoding:'gzip+base64; frame-major[cover:u8,height:u16le]; point-major-level-minor',
+    uncompressedBytes:packed.length,
+    payload
+  };
+  return `// Generated native HRRR cloud timeline tile; do not edit.\n` +
+    `(function(g){var t=Object.freeze(${JSON.stringify(tile)});` +
+    `if(typeof g.__acceptHrrrCloudTile==="function")g.__acceptHrrrCloudTile(t);` +
+    `else(g.HRRR_CLOUD_TILE_QUEUE||(g.HRRR_CLOUD_TILE_QUEUE=[])).push(t);` +
+    `})(typeof window!=="undefined"?window:globalThis);\n`;
+}
+
 export function cloudTileSource(meta, packed) {
   const payload = gzipSync(packed, { level:9, mtime:0 }).toString('base64');
   const tile = {
@@ -577,6 +807,49 @@ export function cloudManifestSource(meta) {
     `})(typeof window!=="undefined"?window:globalThis);\n`;
 }
 
+export function cloudTimelineManifestSource(meta) {
+  const manifest = {
+    schemaVersion:3,
+    source:'NOAA HRRR CONUS pressure product',
+    sourceUrl:SOURCE_PAGE,
+    product:'wrfprsf',
+    generatedAt:meta.generatedAt,
+    run:meta.run,
+    anchorTime:meta.anchorTime,
+    historyHours:meta.historyHours,
+    forecastHours:meta.forecastHours,
+    timeStepMinutes:60,
+    timeChunkSize:meta.timeChunkSize,
+    validTimes:meta.frames.map(frame => frame.validTime),
+    frames:meta.frames.map(frame => ({
+      id:frame.id,
+      validTime:frame.validTime,
+      sourceRun:frame.sourceRun,
+      forecastHour:frame.forecastHour,
+      kind:frame.kind,
+      timeChunk:frame.timeChunk,
+      timeIndex:frame.timeIndex
+    })),
+    levels:LEVELS,
+    variables:{
+      height:'HGT',
+      density:['CLMR', 'CIMIXR'],
+      densityTransfer:'100*(1-exp(-(CLMR+CIMIXR)/7.5e-5))'
+    },
+    datasetId:meta.datasetId,
+    projection:meta.projection,
+    tileSize:meta.tileSize,
+    lods:meta.lods,
+    tileUrlTemplate:'hrrr-cloud-{timeChunk}-l{lod}-x{x}-y{y}.js',
+    releaseBaseUrl:meta.releaseBaseUrl || RELEASE_BASE_URL,
+    nativeResolutionM:meta.projection.dxM,
+    aggregation:'2x2-area-mean'
+  };
+  return `// Generated native HRRR cloud timeline manifest; do not edit.\n` +
+    `(function(g){g.HRRR_CLOUD_MANIFEST=Object.freeze(${JSON.stringify(manifest)});` +
+    `})(typeof window!=="undefined"?window:globalThis);\n`;
+}
+
 export function snapshotSource(meta, packed) {
   const payload = gzipSync(packed, { level:9, mtime:0 }).toString('base64');
   const snapshot = {
@@ -604,102 +877,186 @@ export function snapshotSource(meta, packed) {
 }
 
 async function build(options = {}) {
-  const runMs = Number.isFinite(+options.runMs)
-    ? +options.runMs
-    : await resolveLatestRun({ onProbeError:(time, error) => {
-      console.warn(`HRRR ${runParts(time).iso} unavailable: ${error.message}`);
-    } });
+  const historyHours = Number.isFinite(+options.historyHours)
+    ? Math.max(0, Math.round(+options.historyHours))
+    : HISTORY_HOURS;
+  const forecastHours = Number.isFinite(+options.forecastHours)
+    ? Math.max(0, Math.round(+options.forecastHours))
+    : FORECAST_HOURS;
+  const timeChunkSize = Number.isFinite(+options.timeChunkSize)
+    ? Math.max(1, Math.round(+options.timeChunkSize))
+    : TIME_CHUNK_SIZE;
+  const explicitRun = Number.isFinite(+options.runMs);
+  const anchorMs = Number.isFinite(+options.anchorMs)
+    ? Math.floor(+options.anchorMs / 3_600_000) * 3_600_000
+    : explicitRun
+    ? Math.floor(+options.runMs / 3_600_000) * 3_600_000
+    : Math.floor(Date.now() / 3_600_000) * 3_600_000;
+  const runMs = explicitRun
+    ? Math.floor(+options.runMs / 3_600_000) * 3_600_000
+    : await resolveLatestRun({
+      requiredValidTime:anchorMs + forecastHours * 3_600_000,
+      onProbeError:(time, error) => {
+        console.warn(`HRRR ${runParts(time).iso} unavailable: ${error.message}`);
+      }
+    });
+  const frames = timelineFrameSpecs(
+    anchorMs,
+    historyHours,
+    forecastHours,
+    timeChunkSize,
+    runMs
+  );
   const work = mkdtempSync(resolve(tmpdir(), '3dweather-hrrr-'));
   const miniGrib = resolve(work, 'selected.grib2');
   const rawBin = resolve(work, 'fields.bin');
+  const out = resolve(options.out || DEFAULT_OUT);
+  const outDir = dirname(out);
+  const executable = options.wgrib2 || process.env.WGRIB2 || 'wgrib2';
+  const generatedAt = new Date().toISOString();
+  const datasetId = `${runParts(anchorMs).day}${runParts(anchorMs).hour}-timeline-${Date.parse(generatedAt)}`;
   try {
-    const pieces = [];
-    let sourceBytes = 0;
-    for (const forecastHour of [0, 1]) {
-      const indexUrl = productUrl(runMs, forecastHour, '.idx');
-      const indexResponse = await fetchResponse(indexUrl);
-      const indexText = await indexResponse.text();
-      const records = parseIndex(indexText);
-      const selected = selectCloudRecords(records);
-      const ranges = coalesceCloudRanges(selected);
-      const gribUrl = productUrl(runMs, forecastHour);
-      console.log(`HRRR f${String(forecastHour).padStart(2, '0')}: ${ranges.length} ranges, ` +
-        `${(ranges.reduce((sum, range) => sum + range.bytes, 0) / 1024 / 1024).toFixed(2)} MiB`);
-      const buffers = await fetchByteRanges(gribUrl, ranges);
-      pieces.push(...buffers);
-      sourceBytes += buffers.reduce((sum, buffer) => sum + buffer.length, 0);
-    }
-    writeFileSync(miniGrib, Buffer.concat(pieces));
-
-    const executable = options.wgrib2 || process.env.WGRIB2 || 'wgrib2';
-    const projection = parseNativeGrid(
-      runWgrib2(executable, [miniGrib, '-d', '1', '-grid'], 'wgrib2 native grid inspection')
-    );
-    validateRegriddedInventory(
-      runWgrib2(executable, [miniGrib, '-s'], 'wgrib2 inventory validation')
-    );
-    runWgrib2(executable, [
-      miniGrib,
-      '-order', 'we:sn',
-      '-no_header',
-      '-bin', rawBin
-    ], 'wgrib2 binary export');
-
-    const nativeGrid = {
-      nx:projection.nx,
-      ny:projection.ny,
-      dxM:projection.dxM,
-      dyM:projection.dyM
-    };
-    const packed = packRegriddedBinary(readFileSync(rawBin), nativeGrid);
-    const generatedAt = new Date().toISOString();
-    const validTimes = [runMs, runMs + 3_600_000].map(value => new Date(value).toISOString());
-    const out = resolve(options.out || DEFAULT_OUT);
-    const outDir = dirname(out);
     rmSync(outDir, { recursive:true, force:true });
     mkdirSync(outDir, { recursive:true });
-    const datasetId = `${runParts(runMs).day}${runParts(runMs).hour}-${Date.parse(generatedAt)}`;
-    const lods = [];
-    let levelPacked = packed;
-    let levelGrid = nativeGrid;
+
+    let projection = null;
+    let nativeGrid = null;
+    let lods = null;
+    let sourceBytes = 0;
     let publishedBytes = 0;
-    for (let lod = 0; lod < LOD_COUNT; lod++) {
-      const tilesX = Math.ceil(levelGrid.nx / TILE_SIZE);
-      const tilesY = Math.ceil(levelGrid.ny / TILE_SIZE);
-      lods.push({
-        lod,
-        horizontalSizeM:projection.dxM * 2 ** lod,
-        nx:levelGrid.nx,
-        ny:levelGrid.ny,
-        tilesX,
-        tilesY
-      });
-      for (let tileY = 0; tileY < tilesY; tileY++) for (let tileX = 0; tileX < tilesX; tileX++) {
-        const tile = extractPackedTile(levelPacked, levelGrid, tileX, tileY, TILE_SIZE);
-        const name = `hrrr-cloud-l${lod}-x${tileX}-y${tileY}.js`;
-        const source = cloudTileSource({
-          datasetId,
-          lod,
-          tileX,
-          tileY,
-          x0:tile.x0,
-          y0:tile.y0,
-          nx:tile.nx,
-          ny:tile.ny
-        }, tile.packed);
-        writeFileSync(resolve(outDir, name), source);
-        publishedBytes += Buffer.byteLength(source);
+    let nativeDecodedBytes = 0;
+
+    const chunks = [];
+    for (const frame of frames) {
+      let chunk = chunks[chunks.length - 1];
+      if (!chunk || chunk.id !== frame.timeChunk) {
+        chunk = { id:frame.timeChunk, frames:[] };
+        chunks.push(chunk);
       }
-      if (lod + 1 < LOD_COUNT) {
-        const next = downsamplePackedGrid2x(levelPacked, levelGrid);
-        levelPacked = next.packed;
-        levelGrid = next.grid;
+      chunk.frames.push(frame);
+    }
+
+    for (const chunk of chunks) {
+      const framePyramids = [];
+      for (const frame of chunk.frames) {
+        const indexUrl = productUrl(frame.sourceRunMs, frame.forecastHour, '.idx');
+        const indexResponse = await fetchResponse(indexUrl);
+        const records = parseIndex(await indexResponse.text());
+        const selected = selectCloudRecords(records);
+        const ranges = coalesceCloudRanges(selected);
+        const gribUrl = productUrl(frame.sourceRunMs, frame.forecastHour);
+        const expectedMiB = ranges.reduce((sum, range) => sum + range.bytes, 0) / 1024 / 1024;
+        console.log(
+          `${frame.id} ${frame.kind} f${String(frame.forecastHour).padStart(2, '0')}: ` +
+          `${ranges.length} ranges, ${expectedMiB.toFixed(2)} MiB`
+        );
+        const buffers = await fetchByteRanges(gribUrl, ranges);
+        const frameBytes = buffers.reduce((sum, buffer) => sum + buffer.length, 0);
+        sourceBytes += frameBytes;
+        writeFileSync(miniGrib, Buffer.concat(buffers));
+
+        const frameProjection = parseNativeGrid(runWgrib2(
+          executable,
+          [miniGrib, '-d', '1', '-grid'],
+          `wgrib2 ${frame.id} native grid inspection`
+        ));
+        validateTimelineFrameInventory(
+          runWgrib2(executable, [miniGrib, '-s'], `wgrib2 ${frame.id} inventory validation`),
+          frame.forecastHour
+        );
+        if (!projection) {
+          projection = frameProjection;
+          nativeGrid = {
+            nx:projection.nx,
+            ny:projection.ny,
+            dxM:projection.dxM,
+            dyM:projection.dyM
+          };
+          lods = Array.from({ length:LOD_COUNT }, (_, lod) => {
+            const nx = Math.ceil(nativeGrid.nx / 2 ** lod);
+            const ny = Math.ceil(nativeGrid.ny / 2 ** lod);
+            return {
+              lod,
+              horizontalSizeM:projection.dxM * 2 ** lod,
+              nx,
+              ny,
+              tilesX:Math.ceil(nx / TILE_SIZE),
+              tilesY:Math.ceil(ny / TILE_SIZE)
+            };
+          });
+        } else {
+          for (const key of [
+            'nx', 'ny', 'dxM', 'dyM', 'firstLat', 'firstLon',
+            'orientationLon', 'standardParallel1', 'standardParallel2'
+          ]) {
+            if (Math.abs(+frameProjection[key] - +projection[key]) > 1e-6) {
+              throw new Error(`HRRR projection changed at ${frame.id}: ${key}`);
+            }
+          }
+        }
+        runWgrib2(executable, [
+          miniGrib,
+          '-order', 'we:sn',
+          '-no_header',
+          '-bin', rawBin
+        ], `wgrib2 ${frame.id} binary export`);
+
+        let level = {
+          packed:packTimelineFrameBinary(readFileSync(rawBin), nativeGrid),
+          grid:nativeGrid
+        };
+        nativeDecodedBytes += level.packed.length;
+        const pyramid = [level];
+        for (let lod = 1; lod < LOD_COUNT; lod++) {
+          level = downsampleTimelineFrame2x(level.packed, level.grid);
+          pyramid.push(level);
+        }
+        framePyramids.push(pyramid);
+      }
+
+      for (let lod = 0; lod < LOD_COUNT; lod++) {
+        const lodMeta = lods[lod];
+        for (let tileY = 0; tileY < lodMeta.tilesY; tileY++) {
+          for (let tileX = 0; tileX < lodMeta.tilesX; tileX++) {
+            const extracted = framePyramids.map(pyramid =>
+              extractTimelineFrameTile(
+                pyramid[lod].packed,
+                pyramid[lod].grid,
+                tileX,
+                tileY,
+                TILE_SIZE
+              )
+            );
+            const first = extracted[0];
+            const name = `hrrr-cloud-${chunk.id}-l${lod}-x${tileX}-y${tileY}.js`;
+            const source = cloudTimelineTileSource({
+              datasetId,
+              timeChunk:chunk.id,
+              frameIds:chunk.frames.map(frame => frame.id),
+              validTimes:chunk.frames.map(frame => frame.validTime),
+              lod,
+              tileX,
+              tileY,
+              x0:first.x0,
+              y0:first.y0,
+              nx:first.nx,
+              ny:first.ny
+            }, extracted.map(tile => tile.packed));
+            writeFileSync(resolve(outDir, name), source);
+            publishedBytes += Buffer.byteLength(source);
+          }
+        }
       }
     }
-    const manifest = cloudManifestSource({
+
+    const manifest = cloudTimelineManifestSource({
       generatedAt,
       run:runParts(runMs).iso,
-      validTimes,
+      anchorTime:runParts(anchorMs).iso,
+      historyHours,
+      forecastHours,
+      timeChunkSize,
+      frames,
       datasetId,
       projection,
       tileSize:TILE_SIZE,
@@ -710,9 +1067,14 @@ async function build(options = {}) {
     writeFileSync(temporary, manifest);
     renameSync(temporary, out);
     publishedBytes += Buffer.byteLength(manifest);
-    console.log(`Wrote ${basename(out)} + ${lods.reduce((sum, item) => sum + item.tilesX * item.tilesY, 0)} tiles: ` +
+    const spatialTileCount = lods.reduce(
+      (sum, item) => sum + item.tilesX * item.tilesY,
+      0
+    );
+    console.log(`Wrote ${basename(out)} + ${spatialTileCount * chunks.length} timeline tiles: ` +
       `${(publishedBytes / 1024 / 1024).toFixed(2)} MiB published, ` +
-      `${(packed.length / 1024 / 1024).toFixed(2)} MiB native decoded, ` +
+      `${frames.length} frames (${historyHours}h history → ${forecastHours}h forecast), ` +
+      `${(nativeDecodedBytes / 1024 / 1024).toFixed(2)} MiB native decoded, ` +
       `${(sourceBytes / 1024 / 1024).toFixed(2)} MiB source ranges`);
     return out;
   } finally {
@@ -726,8 +1088,12 @@ function parseArguments(argv) {
     const arg = argv[index];
     if (arg === '--out') options.out = argv[++index];
     else if (arg === '--run') options.runMs = Date.parse(argv[++index]);
+    else if (arg === '--anchor') options.anchorMs = Date.parse(argv[++index]);
     else if (arg === '--release-base-url') options.releaseBaseUrl = argv[++index];
     else if (arg === '--wgrib2') options.wgrib2 = argv[++index];
+    else if (arg === '--history-hours') options.historyHours = +argv[++index];
+    else if (arg === '--forecast-hours') options.forecastHours = +argv[++index];
+    else if (arg === '--time-chunk-size') options.timeChunkSize = +argv[++index];
     else throw new Error(`Unknown option: ${arg}`);
   }
   return options;
