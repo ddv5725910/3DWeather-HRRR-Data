@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
-      DATASET_TAG: hrrr-cloud-${{ github.run_id }}-${{ github.run_attempt }}
+      DATASET_TAG: hrrr-cloud-${{ github.run_id }}
     steps:
       - uses: actions/checkout@v4
       - uses: conda-incubator/setup-miniconda@v3
@@ -63,8 +63,27 @@ jobs:
               --notes "Immutable hourly NOAA HRRR cloud timeline used by the stable manifest." \
               --prerelease
           fi
+          # GitHub applies a secondary limit when hundreds of assets are
+          # uploaded concurrently. Keep each batch at the already-proven
+          # 59-spatial-tile size, pace batches, and retry after cooldown.
+          for time_chunk in $(seq -w 0 10); do
+            assets=(dist/hrrr-clouds/hrrr-cloud-t"${time_chunk}"-l*.js)
+            uploaded=false
+            for attempt in 1 2 3 4 5; do
+              if gh release upload "${DATASET_TAG}" "${assets[@]}" --clobber; then
+                uploaded=true
+                break
+              fi
+              sleep $((attempt * 45))
+            done
+            if [[ "${uploaded}" != true ]]; then
+              echo "Failed to upload time chunk t${time_chunk} after retries" >&2
+              exit 1
+            fi
+            sleep 10
+          done
           gh release upload "${DATASET_TAG}" \
-            dist/hrrr-clouds/*.js \
+            dist/hrrr-clouds/hrrr-cloud-manifest.js \
             --clobber
 
           if ! gh release view hrrr-cloud-data >/dev/null 2>&1; then
