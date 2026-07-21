@@ -11,6 +11,7 @@ import {
   extractWindTile,
   packWindBinary,
   parseWindOrientation,
+  resolveLatestWindRun,
   selectWindRecords,
   validateWindInventory,
   windManifestSource,
@@ -58,6 +59,30 @@ test('detects whether GRIB wind components follow the Lambert grid or true north
   assert.equal(parseWindOrientation('grid_template=30:winds(grid):'), 'grid-relative');
   assert.equal(parseWindOrientation('grid_template=30:winds(N/S):'), 'earth-relative');
   assert.throws(() => parseWindOrientation('Lambert Conformal'), /no winds/);
+});
+
+test('wind run selection falls back until both f00 and f01 inventories are complete', async () => {
+  const probes = [];
+  const resolved = await resolveLatestWindRun({
+    now:Date.parse('2026-07-21T16:55:00Z'),
+    fetchImpl:async url => {
+      probes.push(url);
+      const available = url.includes('hrrr.t15z.wrfprsf');
+      return {
+        ok:available,
+        status:available ? 200 : 404,
+        headers:{ get:() => null },
+        text:async () => available
+          ? ':UGRD:10 m above ground:\n:VGRD:10 m above ground:\n:UGRD:150 mb:\n:VGRD:150 mb:'
+          : ''
+      };
+    },
+    timeoutMs:100
+  });
+  assert.equal(resolved, Date.parse('2026-07-21T15:00:00Z'));
+  assert.ok(probes[0].includes('hrrr.t16z.wrfprsf00.grib2.idx'));
+  assert.ok(probes[1].includes('hrrr.t15z.wrfprsf00.grib2.idx'));
+  assert.ok(probes[2].includes('hrrr.t15z.wrfprsf01.grib2.idx'));
 });
 
 test('packs field-major floats as point-major signed U/V components at 0.1 m/s', () => {

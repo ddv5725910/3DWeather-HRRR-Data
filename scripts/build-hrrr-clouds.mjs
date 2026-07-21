@@ -261,6 +261,12 @@ export async function resolveLatestRun(options = {}) {
   const requiredValidTime = Number.isFinite(+options.requiredValidTime)
     ? Math.floor(+options.requiredValidTime / 3_600_000) * 3_600_000
     : NaN;
+  const requestedForecastHours = Array.isArray(options.forecastHours)
+    ? [...new Set(options.forecastHours.map(Number))]
+    : null;
+  const requiredIndexTokens = Array.isArray(options.requiredIndexTokens) && options.requiredIndexTokens.length
+    ? options.requiredIndexTokens.map(String)
+    : [':HGT:1000 mb:', ':CIMIXR:850 mb:'];
   // Operational files are not instantaneous at the top of the hour. Start
   // from the prior UTC hour, then walk backwards without retrying nonexistent
   // cycles as if they were transient server failures.
@@ -268,18 +274,27 @@ export async function resolveLatestRun(options = {}) {
   const fetchImpl = options.fetchImpl || fetch;
   for (let offset = 0; offset < 8; offset++) {
     const runMs = first - offset * 3_600_000;
-    const forecastHour = Number.isFinite(requiredValidTime)
+    const forecastHours = requestedForecastHours || [Number.isFinite(requiredValidTime)
       ? Math.round((requiredValidTime - runMs) / 3_600_000)
-      : 1;
-    if (forecastHour < 0 || forecastHour > 48) continue;
+      : 1];
+    if (!forecastHours.length || forecastHours.some(hour =>
+      !Number.isInteger(hour) || hour < 0 || hour > 48
+    )) continue;
     try {
-      const response = await fetchResponse(productUrl(runMs, forecastHour, '.idx'), {
-        fetchImpl,
-        attempts:1,
-        timeoutMs:options.timeoutMs || 12_000
-      });
-      const text = await response.text();
-      if (text.includes(':HGT:1000 mb:') && text.includes(':CIMIXR:850 mb:')) return runMs;
+      let complete = true;
+      for (const forecastHour of forecastHours) {
+        const response = await fetchResponse(productUrl(runMs, forecastHour, '.idx'), {
+          fetchImpl,
+          attempts:1,
+          timeoutMs:options.timeoutMs || 12_000
+        });
+        const text = await response.text();
+        if (!requiredIndexTokens.every(token => text.includes(token))) {
+          complete = false;
+          break;
+        }
+      }
+      if (complete) return runMs;
     } catch (error) {
       if (options.onProbeError) options.onProbeError(runMs, error);
     }

@@ -1,6 +1,14 @@
 name: Update HRRR wind tiles
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/update-hrrr-wind.yml'
+      - 'scripts/build-hrrr-wind.mjs'
+      - 'scripts/build-hrrr-clouds.mjs'
+      - 'tests/hrrr-wind-data.test.mjs'
   schedule:
     # Run after the cloud job's minute-17 start so both jobs avoid NOAA's
     # top-of-hour publication burst.

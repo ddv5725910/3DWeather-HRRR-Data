@@ -31,6 +31,9 @@ components, never direction angles. The manifest records HRRR's
 geographic east/north with the Lambert convergence angle. One manifest and 59
 tiles are replaced hourly under the stable
 [`hrrr-wind-data`](../../releases/tag/hrrr-wind-data) Release.
+Before building, the workflow verifies that both `f00` and `f01` inventories
+contain the required wind fields and walks back to the newest complete cycle;
+a partially published current cycle therefore cannot fail the hourly update.
 
 Data source: [NOAA HRRR Open Data](https://registry.opendata.aws/noaa-hrrr-pds/).
 This visualization feed is not intended for operational aviation use.

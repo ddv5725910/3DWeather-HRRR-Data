@@ -39,8 +39,22 @@ export const LEVELS = Object.freeze([
   )
 ]);
 export const VARIABLES = Object.freeze(['UGRD', 'VGRD']);
+const WIND_RUN_INDEX_TOKENS = Object.freeze([
+  ':UGRD:10 m above ground:',
+  ':VGRD:10 m above ground:',
+  ':UGRD:150 mb:',
+  ':VGRD:150 mb:'
+]);
 
 const wait = ms => new Promise(resolvePromise => setTimeout(resolvePromise, ms));
+
+export function resolveLatestWindRun(options = {}) {
+  return resolveLatestRun({
+    ...options,
+    forecastHours:[0, 1],
+    requiredIndexTokens:WIND_RUN_INDEX_TOKENS
+  });
+}
 
 async function fetchText(url) {
   let lastError;
@@ -304,7 +318,7 @@ export function windManifestSource(meta) {
 async function build(options = {}) {
   const runMs = Number.isFinite(+options.runMs)
     ? +options.runMs
-    : await resolveLatestRun({ onProbeError:(time, error) => {
+    : await resolveLatestWindRun({ onProbeError:(time, error) => {
       console.warn(`HRRR ${runParts(time).iso} unavailable: ${error.message}`);
     } });
   const work = mkdtempSync(resolve(tmpdir(), '3dweather-hrrr-wind-'));
